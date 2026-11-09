@@ -7,8 +7,9 @@ edition = "2024"
 bindgen = "*"
 
 [dependencies]
-plonky2 = { git = "https://github.com/0xPARC/plonky2.git", rev = "109d517d09c210ae4c2cee381d3e3fbc04aa3812" }
-pod2 = { git="https://github.com/0xPARC/pod2", rev = "364088d316925f59693ed172ead383e4996de410", default-features = false, features = ["backend_plonky2", "zk"]}
+# The revisions digital-objects-network v0.1.0-rc.50 (616e0eb) builds with.
+plonky2 = { git = "https://github.com/0xPARC/plonky2.git", rev = "60e32369b7b5c8f0ff1e44265005f7c3c3a0a04b" }
+pod2 = { git="https://github.com/0xPARC/pod2", rev = "331a1145a8a5679a63058953464969fb960d9955", default-features = false, features = ["backend_plonky2", "zk"]}
 serde = "1.0.219"
 serde_json = "1.0.143"
 anyhow = "1.0.56"
@@ -19,11 +20,10 @@ ff = { package = "ff", version = "0.13", features = ["derive"] }
 num = { version = "0.4", default-features = false }
 num-bigint = { version = "0.4", features = ["rand"] }
 lazy_static = "1.4.0"
-sha2          = "0.10"
 
 [features]
 default = ["backend_plonky2", "zk", "mem_cache"]
-backend_plonky2 = ["pod2/plonky2"]
+backend_plonky2 = ["pod2/backend_plonky2"]
 zk = ["pod2/zk"]
 disk_cache = ["pod2/disk_cache"]
 mem_cache = ["pod2/mem_cache"]

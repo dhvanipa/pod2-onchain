@@ -3,6 +3,7 @@ package pod2onchain
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"os"
@@ -215,6 +216,8 @@ func Groth16ProofStore(r1cs constraint.ConstraintSystem, pk groth16.ProvingKey, 
 	// convert public inputs
 	inputBytes, err := witnessPublic.MarshalBinary()
 	checkErr(err)
+	// skip the header: 4 bytes nbPublic, 4 bytes nbSecret, 4 bytes nb elements
+	inputBytes = inputBytes[12:]
 
 	nbInputs := len(inputBytes) / fr.Bytes
 	var input []*big.Int
@@ -250,6 +253,25 @@ func Groth16ProofStore(r1cs constraint.ConstraintSystem, pk groth16.ProvingKey, 
 	commitmentPok[0] = new(big.Int).SetBytes(proofBytes[fpSize*8+4+2*commitmentCount*fpSize : fpSize*8+4+2*commitmentCount*fpSize+fpSize])
 	commitmentPok[1] = new(big.Int).SetBytes(proofBytes[fpSize*8+4+2*commitmentCount*fpSize+fpSize : fpSize*8+4+2*commitmentCount*fpSize+2*fpSize])
 	fmt.Println("[solidity] commitmentPok", commitmentPok)
+
+	// the same, as the arguments of the generated verifier's verifyProof, for
+	// a contract or a test to read
+	toStrings := func(xs []*big.Int) []string {
+		out := make([]string, len(xs))
+		for i, x := range xs {
+			out[i] = x.String()
+		}
+		return out
+	}
+	calldata, err := json.MarshalIndent(map[string][]string{
+		"proof":         toStrings(proofSol[:]),
+		"commitments":   toStrings(commitments),
+		"commitmentPok": toStrings(commitmentPok[:]),
+		"input":         toStrings(input),
+	}, "", "  ")
+	checkErr(err)
+	err = os.WriteFile(filepath.Join(outputsPath, "solidity_calldata.json"), calldata, 0o644)
+	checkErr(err)
 
 	// check that the proof can be verified in the Solidity smart contract
 	// through gnark-solidity-checker
