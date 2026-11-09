@@ -1,203 +1,223 @@
-use anyhow::Result;
-use itertools::Itertools;
+//! Wraps a pod2 MainPod's proof into a plonky2 proof that a Groth16 circuit
+//! can verify (its Merkle caps and FRI use Poseidon over BN254, which
+//! gnark-plonky2-verifier checks), and exposes the pod's public statement as
+//! public inputs that a smart contract reads directly.
+//!
+//! Since pod2#514 a MainPod commits to its public statements as the root of
+//! an `Array` of their hashes, and its proof's public inputs are
+//! `[statements_root (4), vds_root (4), is_main (1)]`. The wrapper supports a
+//! pod with exactly one public statement whose arguments are literal values:
+//!
+//! 1. it verifies the MainPod proof against the MainPod circuit's verifier
+//!    data, a constant, so only a real MainPod passes;
+//! 2. it fixes `vds_root` to pod2's `DEFAULT_VD_SET` root and `is_main` to 1,
+//!    as `MainPod::verify` checks natively;
+//! 3. it rebuilds the statement from the public inputs (its predicate hash,
+//!    then each argument's value followed by 4 zeros, which rules out anchored
+//!    keys), hashes it, and requires the root of the one-element array,
+//!    `kv_hash(0, hash)`, to be the proof's `statements_root`.
+//!
+//! Public inputs, 24 Goldilocks elements:
+//!   0..4    the predicate's hash
+//!   4..24   argument i's value at 4 + 4i .. 8 + 4i (zero for absent ones)
+//!
+//! A contract checks the predicate hash against the one it expects and reads
+//! the arguments.
+
+use anyhow::{Result, anyhow, ensure};
 use std::fs;
 use std::io::Write;
-use std::ops::Deref;
+use std::iter;
 use std::path::Path;
 use std::time::Instant;
 
-use sha2::{Digest, Sha256};
-
 use plonky2::{
-    field::{
-        extension::FieldExtension,
-        types::{Field, PrimeField64},
-    },
-    hash::hash_types::{HashOut, HashOutTarget},
+    field::types::{Field, PrimeField64},
+    hash::{hash_types::HashOutTarget, poseidon::PoseidonHash},
     iop::{
-        ext_target::{unflatten_target, ExtensionTarget},
         target::Target,
         witness::{PartialWitness, WitnessWrite},
     },
-    plonk::config::GenericConfig,
     plonk::{
         circuit_builder::CircuitBuilder,
-        circuit_data::{
-            CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitData,
-            VerifierOnlyCircuitData,
-        },
+        circuit_data::{CircuitConfig, CircuitData, VerifierCircuitData, VerifierOnlyCircuitData},
         proof::ProofWithPublicInputs,
     },
 };
 
 use pod2::{
     backends::plonky2::{
-        basetypes::{Proof, C, D, DEFAULT_VD_SET, F, FE},
-        circuits::{
-            common::{CircuitBuilderPod, Flattenable, StatementTarget},
-            mainpod::calculate_statements_hash_circuit,
-        },
+        basetypes::{C, D, DEFAULT_VD_SET, F},
+        circuits::common::ValueTarget,
         mainpod::{
-            calculate_statements_hash, pad_statement, statement::Statement as bStatement, Prover,
+            Prover, cache_get_rec_main_pod_verifier_circuit_data, public_inputs,
+            statement::Statement as BStatement, statements_mt,
         },
+        primitives::merkletree::{circuit::kv_hash_target, kv_hash},
     },
-    frontend::{MainPodBuilder, Operation},
-    middleware::{containers::Set, Params, Statement, ToFields},
+    frontend::{MainPod, MultiPodBuilder, Operation},
+    middleware::{Params, RawValue, Statement, ToFields, Value},
 };
 
 use crate::poseidon_bn128::config::PoseidonBN128GoldilocksConfig;
 
-/// generates a Groth16-friendly plonky2 proof from the given MainPod
-pub fn prove_pod(
-    pod: pod2::frontend::MainPod,
-) -> Result<(
-    VerifierCircuitData<F, PoseidonBN128GoldilocksConfig, D>,
-    CircuitData<F, PoseidonBN128GoldilocksConfig, D>,
-    ProofWithPublicInputs<F, PoseidonBN128GoldilocksConfig, D>,
-)> {
-    // get POD's circuit related data (verifier_data, circuit_data, proof_with_pis)
-    let pod_verifier_data: VerifierOnlyCircuitData<C, D> = pod.pod.verifier_data();
+type Bn = PoseidonBN128GoldilocksConfig;
 
-    let rec_main_pod_verifier_circuit_data =
-        &*pod2::backends::plonky2::mainpod::cache_get_rec_main_pod_verifier_circuit_data(
-            &pod.pod.params(),
+/// Arguments in a statement (`Params::max_statement_args`).
+const MAX_ARGS: usize = 5;
+/// Field elements per argument: a value's 4, then 4 that are zero for a
+/// literal value (`STATEMENT_ARG_F_LEN`).
+const ARG_LEN: usize = 8;
+/// Field elements of a predicate hash, and of a value.
+const HASH_LEN: usize = 4;
+/// The wrapper's public inputs: the predicate hash and each argument's value.
+pub const NUM_PUBLIC_INPUTS: usize = HASH_LEN + MAX_ARGS * HASH_LEN;
+
+/// The key of the first element of an `Array`.
+fn first_key() -> RawValue {
+    Value::from(0i64).raw()
+}
+
+/// The wrapper's public inputs for `statement`: its predicate hash and its
+/// arguments' values. Fails if an argument is an anchored key.
+pub fn statement_public_inputs(statement: &Statement) -> Result<Vec<F>> {
+    let fields = BStatement::from(statement.clone()).to_fields();
+    ensure!(
+        fields.len() == HASH_LEN + MAX_ARGS * ARG_LEN,
+        "a statement has {} field elements, expected {}",
+        fields.len(),
+        HASH_LEN + MAX_ARGS * ARG_LEN
+    );
+    let mut inputs = fields[..HASH_LEN].to_vec();
+    for i in 0..MAX_ARGS {
+        let arg = &fields[HASH_LEN + i * ARG_LEN..HASH_LEN + (i + 1) * ARG_LEN];
+        ensure!(
+            arg[HASH_LEN..].iter().all(|f| f.is_zero()),
+            "argument {i} of {statement} is not a literal value"
         );
-    let pod_common_circuit_data: CommonCircuitData<F, D> =
-        rec_main_pod_verifier_circuit_data.deref().common.clone();
+        inputs.extend_from_slice(&arg[..HASH_LEN]);
+    }
+    Ok(inputs)
+}
 
-    let pod_proof: Proof = pod.pod.proof();
-    let public_inputs = pod
-        .statements_hash()
-        .to_fields()
-        .iter()
-        .chain(pod.pod.vd_set().root().0.iter())
-        .cloned()
-        .collect_vec();
-    dbg!(&public_inputs);
-    let pod_proof_with_pis = pod2::middleware::ProofWithPublicInputs {
-        proof: pod_proof.clone(),
-        public_inputs,
+/// The pod's one public statement.
+fn single_statement(pod: &MainPod) -> Result<Statement> {
+    let statements = pod.pod.pub_raw_statements();
+    ensure!(
+        statements.len() == 1,
+        "the pod has {} public statements; the wrapper takes exactly one",
+        statements.len()
+    );
+    Ok(statements[0].clone())
+}
+
+/// The wrapper's public inputs for `pod`, as `prove_pod` registers them.
+pub fn prepare_public_inputs(pod: &MainPod) -> Result<Vec<F>> {
+    statement_public_inputs(&single_statement(pod)?)
+}
+
+/// Generates the Groth16-friendly plonky2 proof of the given MainPod.
+pub fn prove_pod(
+    pod: MainPod,
+) -> Result<(
+    VerifierCircuitData<F, Bn, D>,
+    CircuitData<F, Bn, D>,
+    ProofWithPublicInputs<F, Bn, D>,
+)> {
+    let params = pod.pod.params().clone();
+    ensure!(params == Params::default(), "the pod uses other circuit parameters");
+    ensure!(!pod.pod.is_mock(), "the pod is a mock pod");
+    ensure!(
+        pod.pod.vd_set().root() == DEFAULT_VD_SET.root(),
+        "the pod's verifier data set is not pod2's default"
+    );
+    pod.pod
+        .verify()
+        .map_err(|err| anyhow!("the pod does not verify: {err}"))?;
+
+    let statement = single_statement(&pod)?;
+    let statement_hash = BStatement::from(statement.clone()).hash();
+    ensure!(
+        kv_hash(&first_key(), Some(RawValue::from(statement_hash))) == pod.pod.statements_root(),
+        "the one-statement root differs from the pod's statements root"
+    );
+    ensure!(
+        statements_mt(&[BStatement::from(statement.clone())]).commitment()
+            == pod.pod.statements_root(),
+        "statements_mt differs from the pod's statements root"
+    );
+    let values = statement_public_inputs(&statement)?;
+
+    let inner_verifier_only: VerifierOnlyCircuitData<C, D> = pod.pod.verifier_data();
+    let inner_common = cache_get_rec_main_pod_verifier_circuit_data(&params)
+        .common
+        .clone();
+    let inner_proof = pod2::middleware::ProofWithPublicInputs {
+        proof: pod.pod.proof(),
+        public_inputs: public_inputs(pod.pod.statements_root(), pod.pod.vd_set().root(), true),
     };
 
-    // generate new plonky2 proof from POD's proof
     let start = Instant::now();
-    let (verifier_data, common_circuit_data, proof_with_pis) = wrap_bn128(
-        pod_verifier_data,
-        pod_common_circuit_data,
-        pod_proof_with_pis,
-        &pod.public_statements,
-        &pod.params,
-    )?;
-    println!("[TIME] encapsulation proof took: {:?}", start.elapsed());
+    let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
 
-    // sanity check: verify proof
-    verifier_data.verify(proof_with_pis.clone())?;
+    // 1. the MainPod proof, against the MainPod circuit
+    let proof_target = builder.add_virtual_proof_with_pis(&inner_common);
+    let verifier_target = builder.constant_verifier_data(&inner_verifier_only);
+    builder.verify_proof::<C>(&proof_target, &verifier_target, &inner_common);
 
-    debug_assert_eq!(proof_with_pis.public_inputs.len(), 14); // poseidon + vdset_root + sha256 + gamma
-
-    Ok((verifier_data, common_circuit_data, proof_with_pis))
-}
-
-// alternative calculate_id version, which instead of using Goldilocks Poseidon,
-// it uses sha256
-pub fn calculate_statements_hash_sha256(
-    statements: &[bStatement],
-    params: &Params,
-) -> pod2::middleware::Hash {
-    assert!(statements.len() <= params.max_public_statements);
-
-    let mut none_st: bStatement = pod2::middleware::Statement::None.into();
-    pad_statement(&mut none_st);
-    let statements_back_padded = statements
-        .iter()
-        .chain(std::iter::repeat(&none_st))
-        .take(params.max_public_statements)
-        .collect_vec();
-    let field_elems: Vec<F> = statements_back_padded
-        .iter()
-        .rev()
-        .flat_map(|statement| statement.to_fields())
-        .collect::<Vec<_>>();
-
-    let b: Vec<u8> = field_elems
-        .iter()
-        .flat_map(|e| e.to_canonical_u64().to_le_bytes())
-        .collect();
-    let h: Vec<u8> = Sha256::digest(&b).to_vec();
-    bytes_to_hash(h)
-}
-
-fn bytes_to_hash(b: Vec<u8>) -> pod2::middleware::Hash {
-    assert_eq!(b.len(), 32);
-    // make explicit (to the reader of this code) that we only use the first 28
-    // bytes, in chunks of 7 bytes, so that we can fit them into 4 field
-    // elements (a pod2's Hash type)
-    let b: Vec<u8> = b[..28].to_vec();
-    let v: [F; 4] = std::array::from_fn(|i| {
-        F::from_canonical_u64(u64::from_le_bytes(
-            vec![&[0_u8], &b[i * 7..i * 7 + 7]]
-                .concat()
-                .try_into()
-                .unwrap(),
-        ))
-    });
-    pod2::middleware::Hash(v)
-}
-
-pub fn prepare_public_inputs(
-    pod_params: &Params,
-    vdset_root: pod2::middleware::Hash,
-    pub_statements: &[Statement],
-) -> Result<Vec<F>> {
-    // public inputs order:
-    //     0..4: poseidon hash
-    //     4..8: vdset.root
-    //     8..12: sha256 hash
-    //     12..14: gamma
-
-    // convert Statements to backend Statements
-    let pub_st: Vec<bStatement> = pub_statements
-        .iter()
-        .map(|st| bStatement::from(st.clone()))
-        .collect();
-
-    // compute Poseidon & Sha256 hashes out of the statements
-    let statements_poseidon = calculate_statements_hash(&pub_st);
-    let statements_poseidon_firsthalf: [F; 2] = statements_poseidon.0[0..2].try_into().unwrap();
-    let statements_sha256 = calculate_statements_hash_sha256(&pub_st, &pod_params);
-    let statements_sha256_firsthalf: [F; 2] = statements_sha256.0[0..2].try_into().unwrap();
-
-    // get sigma
-    let alpha: FE = FE::from_basefield_array(statements_sha256_firsthalf);
-    let beta: FE = FE::from_basefield_array(statements_poseidon_firsthalf);
-    let sigma = alpha + beta;
-
-    // prepare the statements into the shape of Goldilocks extension elements
-    let mut st_field_elems: Vec<F> = pub_st
-        .iter()
-        .flat_map(|statement| statement.to_fields())
-        .collect::<Vec<_>>();
-    // extend st_field_elems to have length multiple of D
-    let padding_to_multiple_of_D = D - (st_field_elems.len() % D);
-    st_field_elems.resize(st_field_elems.len() + padding_to_multiple_of_D, F::ZERO);
-
-    let st_extension: Vec<FE> = plonky2::field::extension::unflatten::<F, D>(&st_field_elems);
-    // compute gamma = UHF(sigma, statements) = \sum st_i * sigma^i
-    let mut gamma: FE = st_extension[st_extension.len() - 1];
-    for st_e in st_extension.iter().rev().skip(1) {
-        gamma = gamma * sigma + *st_e;
+    // 2. pod2's default verifier data set, and a main pod
+    let vds_root = DEFAULT_VD_SET.root();
+    for i in 0..HASH_LEN {
+        let root_limb = builder.constant(vds_root.0[i]);
+        builder.connect(proof_target.public_inputs[HASH_LEN + i], root_limb);
     }
+    let one = builder.one();
+    builder.connect(proof_target.public_inputs[2 * HASH_LEN], one);
 
-    let r: Vec<F> = vec![
-        statements_poseidon.0.to_vec(),
-        vdset_root.0.to_vec(),
-        statements_sha256.0.to_vec(),
-        gamma.0.to_vec(),
-    ]
-    .concat();
-    debug_assert_eq!(r.len(), 14);
+    // 3. the statement, from the public inputs
+    let values_target: Vec<Target> = builder.add_virtual_targets(NUM_PUBLIC_INPUTS);
+    builder.register_public_inputs(&values_target);
+    let zero = builder.zero();
+    let mut fields_target = values_target[..HASH_LEN].to_vec();
+    for i in 0..MAX_ARGS {
+        let value = &values_target[HASH_LEN + i * HASH_LEN..HASH_LEN + (i + 1) * HASH_LEN];
+        fields_target.extend_from_slice(value);
+        fields_target.extend(iter::repeat_n(zero, ARG_LEN - HASH_LEN));
+    }
+    let statement_hash_target = builder.hash_n_to_hash_no_pad::<PoseidonHash>(fields_target);
+    let key = first_key();
+    let key_target = ValueTarget {
+        elements: std::array::from_fn(|i| builder.constant(key.0[i])),
+    };
+    let root_target = kv_hash_target(
+        &mut builder,
+        &key_target,
+        &ValueTarget {
+            elements: statement_hash_target.elements,
+        },
+    );
+    builder.connect_hashes(
+        root_target,
+        HashOutTarget::from_vec(proof_target.public_inputs[..HASH_LEN].to_vec()),
+    );
 
-    Ok(r)
+    let circuit_data = builder.build::<Bn>();
+    println!(
+        "[TIME] wrapper circuit (2^{} rows) built in {:?}",
+        circuit_data.common.degree_bits(),
+        start.elapsed()
+    );
+
+    let mut pw = PartialWitness::new();
+    pw.set_proof_with_pis_target(&proof_target, &inner_proof)?;
+    pw.set_target_arr(&values_target, &values)?;
+    let start = Instant::now();
+    let proof = circuit_data.prove(pw)?;
+    println!("[TIME] wrapper proof took {:?}", start.elapsed());
+
+    let verifier_data = circuit_data.verifier_data();
+    verifier_data.verify(proof.clone())?;
+    Ok((verifier_data, circuit_data, proof))
 }
 
 /// gets as input the public inputs vector (output from
@@ -215,7 +235,7 @@ pub fn encode_public_inputs_gnark(pub_inp: Vec<F>) -> Vec<u8> {
     pub_inp_bytes.extend_from_slice(&0u32.to_be_bytes());
     pub_inp_bytes.extend_from_slice(&n.to_be_bytes());
     for e in pub_inp {
-        let b = e.0.to_be_bytes();
+        let b = e.to_canonical_u64().to_be_bytes();
         let padding = vec![0u8; 24];
         let b_256 = [padding, b.to_vec()].concat();
         pub_inp_bytes.extend_from_slice(&b_256);
@@ -223,176 +243,48 @@ pub fn encode_public_inputs_gnark(pub_inp: Vec<F>) -> Vec<u8> {
     pub_inp_bytes
 }
 
-pub fn wrap_bn128(
-    verifier_only_data: VerifierOnlyCircuitData<C, D>,
-    common_circuit_data: CommonCircuitData<F, D>,
-    proof_with_public_inputs: ProofWithPublicInputs<F, C, D>,
-    pub_statements: &[Statement],
-    pod_params: &Params,
-) -> Result<(
-    VerifierCircuitData<F, PoseidonBN128GoldilocksConfig, D>,
-    CircuitData<F, PoseidonBN128GoldilocksConfig, D>,
-    ProofWithPublicInputs<F, PoseidonBN128GoldilocksConfig, D>,
-)> {
-    let config = CircuitConfig::standard_recursion_config();
-    let mut builder: CircuitBuilder<<PoseidonBN128GoldilocksConfig as GenericConfig<D>>::F, D> =
-        CircuitBuilder::new(config);
-
-    // 1. create circuit logic, composed of:
-    // 1.a. verify pod proof
-    // 1.b. hash public statements with Poseidon and check that poseidon output
-    //   matches the proof_with_pis.public_inputs first elements
-    //
-    //   For the hashing of the public inputs, we use the approach described at
-    //   https://eprint.iacr.org/2025/1500 and https://eprint.iacr.org/2024/2099 section 4.2.1.
-
-    // 1.a
-    let proof_with_pis_target = builder.add_virtual_proof_with_pis(&common_circuit_data);
-    let verifier_circuit_target = builder.constant_verifier_data(&verifier_only_data);
-    builder.verify_proof::<C>(
-        &proof_with_pis_target,
-        &verifier_circuit_target,
-        &common_circuit_data,
-    );
-    // 1.b
-    let pub_statements_target: Vec<StatementTarget> = (0..pub_statements.len())
-        .map(|_| builder.add_virtual_statement(false))
-        .collect();
-    // compute beta = poseidon(statements)
-    let statements_poseidon_target =
-        calculate_statements_hash_circuit(&mut builder, &pub_statements_target);
-
-    // ensure that `statements_poseidon_target` matches the given
-    // `proof_with_pis_target.public_inputs[0..4]`, which contains the poseidon
-    // hash of the pod2's pub statements
-    builder.connect_hashes(
-        statements_poseidon_target,
-        HashOutTarget::from_vec(proof_with_pis_target.public_inputs[0..4].to_vec()),
-    );
-
-    let statements_sha256_target = builder.add_virtual_hash();
-    // set alpha & beta to the sum of the elements of original alptha & beta
-    // respectively
-    let alpha_ext_target: ExtensionTarget<D> =
-        ExtensionTarget::<D>::try_from(statements_sha256_target.elements[0..2].to_vec()).unwrap();
-    let beta_ext_target: ExtensionTarget<D> =
-        ExtensionTarget::<D>::try_from(statements_poseidon_target.elements[0..2].to_vec()).unwrap();
-    let sigma_ext_target: ExtensionTarget<D> =
-        builder.add_extension(alpha_ext_target, beta_ext_target);
-
-    // NOTE: the statement.flatten() is already computed (although in reverse
-    // order) in the pod2's `calculate_statements_hash_circuit` gadget. Maybe we
-    // can modify pod2's lib to return it avoiding recomputing it here.
-    let statements_flattened: Vec<Target> = pub_statements_target
-        .iter()
-        .flat_map(|s| s.flatten())
-        .collect();
-    let statements_extension = unflatten_target::<D>(&statements_flattened);
-    // compute gamma = UHF(sigma, statements) = \sum st_i * sigma^i
-    let mut gamma_ext_target: ExtensionTarget<D> =
-        statements_extension[statements_extension.len() - 1];
-    for st_e in statements_extension.iter().rev().skip(1) {
-        gamma_ext_target = builder.mul_add_extension(gamma_ext_target, sigma_ext_target, *st_e);
-    }
-
-    // 2. register public inputs, layout:
-    //     0..4: poseidon hash (original pod2's pub statements hash)
-    //     4..8: vdset.root
-    //     8..12: sha256 hash
-    //     12..14: gamma
-
-    // register as public inputs the proof's public inputs
-    builder.register_public_inputs(&proof_with_pis_target.public_inputs);
-    // register as public inputs the sha256 hash of the pub statements, and the
-    // gamma
-    builder.register_public_inputs(&statements_sha256_target.elements);
-    builder.register_public_inputs(&gamma_ext_target.0);
-    // Note: statements_poseidon_target is already registered as a public input
-    // inside the proof_with_pis_target.public_inputs[0..4]
-
-    let circuit_data = builder.build::<PoseidonBN128GoldilocksConfig>();
-
-    // 3. set targets
-    let mut pw = PartialWitness::new();
-    pw.set_verifier_data_target(&verifier_circuit_target, &verifier_only_data)?;
-    pw.set_proof_with_pis_target(&proof_with_pis_target, &proof_with_public_inputs)?;
-    // set the targets for the pub_statements_target
-    for (i, st) in pub_statements.iter().enumerate() {
-        pub_statements_target[i].set_targets(&mut pw, &bStatement::from(st.clone()))?;
-    }
-    // hash pub_statements using sha256
-    let pub_st: Vec<bStatement> = pub_statements
-        .iter()
-        .map(|st| bStatement::from(st.clone()))
-        .collect();
-    let statements_sha256 = calculate_statements_hash_sha256(&pub_st, &pod_params);
-    // assign the sha256 hash value to the target
-    pw.set_hash_target(
-        statements_sha256_target,
-        HashOut::from_vec(statements_sha256.0.to_vec()),
-    )?;
-    // get poseidon's output from the pod's proof public inputs
-    let statements_poseidon: Vec<F> = proof_with_public_inputs.public_inputs[0..4].to_vec();
-    // assign the posedion hash value to the respective target
-    pw.set_hash_target(
-        statements_poseidon_target,
-        HashOut::from_vec(statements_poseidon),
-    )?;
-
-    let vd = circuit_data.verifier_data();
-    let proof = circuit_data.prove(pw)?;
-
-    // sanity check: verify proof
-    vd.verify(proof.clone())?;
-
-    Ok((vd, circuit_data, proof))
-}
-
 pub fn store_files(
     dir: &Path,
-    verifier_only_data: VerifierOnlyCircuitData<PoseidonBN128GoldilocksConfig, D>,
-    common_circuit_data: CircuitData<F, PoseidonBN128GoldilocksConfig, D>,
-    proof_with_pis: ProofWithPublicInputs<F, PoseidonBN128GoldilocksConfig, D>,
+    verifier_only_data: VerifierOnlyCircuitData<Bn, D>,
+    common_circuit_data: CircuitData<F, Bn, D>,
+    proof_with_pis: ProofWithPublicInputs<F, Bn, D>,
 ) -> Result<()> {
     fs::create_dir_all(dir)?;
 
     let json = serde_json::to_string_pretty(&verifier_only_data)?;
-    let mut file = fs::File::create(&dir.join("verifier_only_circuit_data.json"))?;
+    let mut file = fs::File::create(dir.join("verifier_only_circuit_data.json"))?;
     file.write_all(&json.into_bytes())?;
 
     let json = serde_json::to_string_pretty(&proof_with_pis)?;
-    let mut file = fs::File::create(&dir.join("proof_with_public_inputs.json"))?;
+    let mut file = fs::File::create(dir.join("proof_with_public_inputs.json"))?;
     file.write_all(&json.into_bytes())?;
 
     let json = serde_json::to_string_pretty(&common_circuit_data.common)?;
-    let mut file = fs::File::create(&dir.join("common_circuit_data.json"))?;
+    let mut file = fs::File::create(dir.join("common_circuit_data.json"))?;
     file.write_all(&json.into_bytes())?;
 
     let compressed_proof = proof_with_pis.compress(
         &verifier_only_data.circuit_digest,
         &common_circuit_data.common,
     )?;
-    let mut file = fs::File::create(&dir.join("proof_with_public_inputs.bin"))?;
+    let mut file = fs::File::create(dir.join("proof_with_public_inputs.bin"))?;
     file.write_all(&compressed_proof.to_bytes())?;
 
     Ok(())
 }
 
-/// returns a MainPod, example adapted from pod2/examples/main_pod_points.rs
-pub fn sample_main_pod() -> Result<pod2::frontend::MainPod> {
+/// A MainPod with one public statement, `Equal(42, 42)`.
+pub fn sample_main_pod() -> Result<MainPod> {
     let params = Params::default();
-
-    let mut builder = MainPodBuilder::new(&params, &DEFAULT_VD_SET);
-    let set_entries = ["somestring", "2", "3"]
-        .into_iter()
-        .map(|n| n.into())
-        .collect();
-    let set = Set::new(set_entries);
-
-    builder.pub_op(Operation::set_contains(set, "3"))?;
-
-    let prover = Prover {};
-    let pod = builder.prove(&prover).unwrap();
+    let mut builder = MultiPodBuilder::new(&params, &DEFAULT_VD_SET);
+    builder.pub_op(Operation::eq(Value::from(42i64), Value::from(42i64)))?;
+    let pod = builder
+        .solve()
+        .map_err(|err| anyhow!(err))?
+        .prove(&Prover {})
+        .map_err(|err| anyhow!(err))?
+        .output_pod()
+        .clone();
     Ok(pod)
 }
 
@@ -413,13 +305,10 @@ pub fn sample_plonky2_g16_friendly_proof(path: &str) -> Result<()> {
         "[TIME] plonky2 proof (groth16-friendly) took: {:?}",
         start.elapsed()
     );
-    assert_eq!(proof_with_pis.public_inputs.len(), 14); // poseidon + vdset_root + sha256 + gamma
+    assert_eq!(proof_with_pis.public_inputs.len(), NUM_PUBLIC_INPUTS);
 
     // check that the `prepare_public_inputs` method works as expected
-    assert_eq!(
-        proof_with_pis.public_inputs,
-        prepare_public_inputs(&pod.params, pod.pod.vd_set().root(), &pod.public_statements)?
-    );
+    assert_eq!(proof_with_pis.public_inputs, prepare_public_inputs(&pod)?);
 
     // step 3) store the files
     store_files(
@@ -438,5 +327,16 @@ pub mod tests {
     #[test]
     fn test_sample_plonky2_g16_friendly_proof() -> Result<()> {
         sample_plonky2_g16_friendly_proof("./tmp/plonky2-proof")
+    }
+
+    #[test]
+    fn test_public_inputs_layout() -> Result<()> {
+        let statement = Statement::Equal(Value::from(42i64).into(), Value::from(7i64).into());
+        let inputs = statement_public_inputs(&statement)?;
+        assert_eq!(inputs.len(), NUM_PUBLIC_INPUTS);
+        assert_eq!(&inputs[4..8], &Value::from(42i64).raw().0);
+        assert_eq!(&inputs[8..12], &Value::from(7i64).raw().0);
+        assert!(inputs[12..].iter().all(|f| f.is_zero()));
+        Ok(())
     }
 }

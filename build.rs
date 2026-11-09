@@ -44,4 +44,9 @@ fn main() {
         out_path.to_str().unwrap()
     );
     println!("cargo:rustc-link-lib=static=go");
+    // The Go runtime in libgo.a calls CoreFoundation and Security on macOS.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        println!("cargo:rustc-link-lib=framework=Security");
+    }
 }
