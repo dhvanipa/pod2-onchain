@@ -24,6 +24,7 @@ import (
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/consensys/gnark/profile"
 	"github.com/consensys/gnark/test"
+	gl "github.com/succinctlabs/gnark-plonky2-verifier/goldilocks"
 	"github.com/succinctlabs/gnark-plonky2-verifier/types"
 	"github.com/succinctlabs/gnark-plonky2-verifier/variables"
 	"github.com/succinctlabs/gnark-plonky2-verifier/verifier"
@@ -37,8 +38,29 @@ func checkErr(err error, msg ...string) {
 	}
 }
 
+// VerifierCircuit verifies a proof of one plonky2 circuit: the wrapper whose
+// verifier data it was compiled with. verifier.ExampleVerifierCircuit takes
+// VerifierOnlyCircuitData as a secret witness, so its Groth16 key accepts a
+// proof of any circuit with the same CommonCircuitData, including a wrapper
+// with other constants baked in (another inner circuit, another verifier
+// data set root), which could prove any public inputs. Here the verifier data
+// is not a witness (`gnark:"-"`): its values are constants of the R1CS, and
+// the Groth16 key is bound to this wrapper.
+type VerifierCircuit struct {
+	PublicInputs            []gl.Variable                     `gnark:",public"`
+	Proof                   variables.Proof                   `gnark:",secret"`
+	VerifierOnlyCircuitData variables.VerifierOnlyCircuitData `gnark:"-"`
+	CommonCircuitData       types.CommonCircuitData           `gnark:"-"`
+}
+
+func (c *VerifierCircuit) Define(api frontend.API) error {
+	verifierChip := verifier.NewVerifierChip(api, c.CommonCircuitData)
+	verifierChip.Verify(c.Proof, c.PublicInputs, c.VerifierOnlyCircuitData)
+	return nil
+}
+
 func R1csCircuit(proofWithPis variables.ProofWithPublicInputs, verifierOnlyCircuitData variables.VerifierOnlyCircuitData, commonCircuitData types.CommonCircuitData, outputsPath string) constraint.ConstraintSystem {
-	circuit := verifier.ExampleVerifierCircuit{
+	circuit := VerifierCircuit{
 		Proof:                   proofWithPis.Proof,
 		PublicInputs:            proofWithPis.PublicInputs,
 		VerifierOnlyCircuitData: verifierOnlyCircuitData,
@@ -106,7 +128,7 @@ func TrustedSetup(r1cs constraint.ConstraintSystem, outputsPath string) (groth16
 func CheckR1CS(r1cs constraint.ConstraintSystem, proofWithPis variables.ProofWithPublicInputs, verifierOnlyCircuitData variables.VerifierOnlyCircuitData, commonCircuitData types.CommonCircuitData) {
 	var err error
 
-	assignment := verifier.ExampleVerifierCircuit{
+	assignment := VerifierCircuit{
 		Proof:                   proofWithPis.Proof,
 		PublicInputs:            proofWithPis.PublicInputs,
 		VerifierOnlyCircuitData: verifierOnlyCircuitData,
@@ -128,7 +150,7 @@ func CheckR1CS(r1cs constraint.ConstraintSystem, proofWithPis variables.ProofWit
 func Groth16Proof(r1cs constraint.ConstraintSystem, pk groth16.ProvingKey, vk groth16.VerifyingKey, proofWithPis variables.ProofWithPublicInputs, verifierOnlyCircuitData variables.VerifierOnlyCircuitData, commonCircuitData types.CommonCircuitData) (groth16.Proof, witness.Witness, error) {
 	var err error
 
-	assignment := verifier.ExampleVerifierCircuit{
+	assignment := VerifierCircuit{
 		Proof:                   proofWithPis.Proof,
 		PublicInputs:            proofWithPis.PublicInputs,
 		VerifierOnlyCircuitData: verifierOnlyCircuitData,
@@ -161,7 +183,7 @@ func Groth16Proof(r1cs constraint.ConstraintSystem, pk groth16.ProvingKey, vk gr
 func Groth16ProofStore(r1cs constraint.ConstraintSystem, pk groth16.ProvingKey, vk groth16.VerifyingKey, proofWithPis variables.ProofWithPublicInputs, verifierOnlyCircuitData variables.VerifierOnlyCircuitData, commonCircuitData types.CommonCircuitData, outputsPath string, solidityCheck bool) {
 	var err error
 
-	assignment := verifier.ExampleVerifierCircuit{
+	assignment := VerifierCircuit{
 		Proof:                   proofWithPis.Proof,
 		PublicInputs:            proofWithPis.PublicInputs,
 		VerifierOnlyCircuitData: verifierOnlyCircuitData,

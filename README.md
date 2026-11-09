@@ -1,7 +1,7 @@
 # pod2-onchain
 Prove POD2s onchain in Ethereum.
 
-## Branch `port-pod2-331a1145`
+## pod2 `331a1145`
 
 Ports the wrapper to pod2 `331a1145` and plonky2 `60e32369`, the revisions
 digital-objects-network v0.1.0-rc.50 builds with. Since pod2#514 a MainPod
@@ -32,10 +32,38 @@ Measured on 2026-11-09 on an M3 Pro, with a real Bitcraft item's pod (one
 | Step | Time | Peak memory |
 |---|---:|---:|
 | wrapper proof (circuit 2^13 rows) | 7.7 s, 11.7 s with building the circuit | 1.6 GB |
-| Groth16 circuit | 5,567,234 constraints, compiled in 50 s | |
-| Groth16 setup | about 17 min | about 9.3 GB (sampled) |
-| Groth16 proof | 36.6 s, after 236 s loading the 1.36 GB proving key | 11.2 GB |
+| Groth16 circuit | 5,566,502 constraints, compiled in 26 s | |
+| Groth16 setup | 552 s | 13.7 GB |
+| Groth16 proof | 16.7 s, after 107 s loading the 1.36 GB proving key | 9.8 GB |
 | `verifyProof` on-chain, 24 public inputs | 543,110 gas | |
+
+The setup and proof rows are from the fixed circuit below, on an otherwise
+idle machine. The first measurements, made while other proofs ran, were about
+17 min for the setup and 36.6 s plus 236 s for the proof.
+
+## The verifier data is a constant of the Groth16 circuit
+
+`verifier.ExampleVerifierCircuit`, from gnark-plonky2-verifier, takes the
+inner circuit's `VerifierOnlyCircuitData` (its constants and sigmas cap, and
+its digest) as a secret witness. Its Groth16 key then accepts a proof of any
+plonky2 circuit with the same `CommonCircuitData`, not only of the wrapper
+it was set up with. A look-alike wrapper with other constants, say another
+verifier-data set root or a circuit that skips the MainPod check, could prove
+any 24 public inputs, and a contract using the generated `Verifier.sol` would
+accept them.
+
+`podprover.go` now uses its own `VerifierCircuit`, whose
+`VerifierOnlyCircuitData` is not a witness (`gnark:"-"`): its values are
+compiled into the R1CS as constants, so the Groth16 key is bound to this one
+wrapper. On 2026-11-09 the circuit went from 11,318 secret inputs to 11,301
+(the 16 sigmas-cap hashes and the digest are now constants) and from
+5,567,234 constraints to 5,566,502. A `Verifier.sol` generated before this
+change should not be used; the new setup's verifier rejects proofs made with
+the old one (`CommitmentInvalid`).
+
+The wrapper circuit itself is the same for every single-statement MainPod,
+since the predicate's hash is a public input, so one setup serves every
+predicate.
 
 ## Run tests
 - FFI test, run: `cargo test --release test_groth_full_flow -- --nocapture`
